@@ -1,9 +1,9 @@
 //! Clearing the pixels of an image under redaction regions. The image is decoded, every pixel
-//! whose centre maps into a region is set to zero (no ink for image masks), and the result is
+//! whose footprint intersects a region is set to zero (no ink for image masks), and the result is
 //! written as a new Flate image; the original object is untouched (other pages may use it).
-//! A DCT (JPEG) image is decoded with the `image` crate so a scan keeps everything outside the
-//! mark; images whose codec PdfCraft can't decode (JPX, JBIG2, CCITT) return `None`, and the
-//! caller removes the whole image instead; that is fail-closed.
+//! DCT (JPEG) images in supported 8-bit grayscale and RGB layouts are decoded so unmarked samples
+//! remain. Unsupported codecs/layouts (JPX, JBIG2, CCITT and other DCT cases) return `None`, and
+//! the caller removes the whole image instead; that is fail-closed.
 
 use pdfcraft_content::{Matrix, overlaps};
 use pdfcraft_cos::{Document, Object, Stream};
@@ -15,7 +15,14 @@ const MAX_PIXELS: u64 = 64 << 20;
 /// size and component count its dictionary declares (the caller then removes the image, as for
 /// any other undecodable codec).
 fn jpeg_samples(raw: &[u8], ncomp: usize, w: usize, h: usize) -> Option<Vec<u8>> {
-    let img = ::image::load_from_memory_with_format(raw, ::image::ImageFormat::Jpeg).ok()?;
+    let mut reader = ::image::ImageReader::with_format(std::io::Cursor::new(raw), ::image::ImageFormat::Jpeg);
+    let mut limits = ::image::Limits::default();
+    // Match the PDF's checked raster dimensions before decoding, so a mismatched JPEG header
+    // cannot make the decoder allocate for a larger image than this redaction path permits.
+    limits.max_image_width = Some(u32::try_from(w).ok()?);
+    limits.max_image_height = Some(u32::try_from(h).ok()?);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     if (img.width() as usize, img.height() as usize) != (w, h) {
         return None;
     }
@@ -49,7 +56,7 @@ fn components(doc: &Document, s: &Stream) -> Option<usize> {
     })
 }
 
-/// `Ok(Some(copy))` with the covered pixels cleared, `Ok(None)` when no pixel centre is covered,
+/// `Ok(Some(copy))` with the covered pixels cleared, `Ok(None)` when no pixel intersects,
 /// `Err(())` when the image can't be cleared (the caller removes it).
 #[allow(clippy::result_unit_err)]
 pub(crate) fn clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Result<Option<Stream>, ()> {
@@ -73,8 +80,8 @@ fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]
         Some(Object::Array(a)) => a.iter().map(|f| f.as_name()).collect::<Option<_>>()?,
         _ => return None,
     };
-    // PdfCraft patch (#2246): a DCT image (a scan) is decoded so only the covered pixels are
-    // cleared. Removing the whole image blanks the page, so DCT is handled rather than refused.
+    // The JPEG decoder consumes the raw bytes, so accept DCT only as a single filter. Other filter
+    // chains retain the upstream supported-filter rules and bounded PDF stream decoder below.
     let dct = matches!(filters.as_slice(), [b"DCTDecode"] | [b"DCT"]);
     if !dct && !filters.iter().all(|n| supported(n)) {
         return None;
@@ -96,16 +103,17 @@ fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]
     let bytes = row.checked_mul(h)?;
     let row_bits = row.checked_mul(8)?;
     bytes.checked_mul(8)?;
-    // PdfCraft patch (#2246): a DCT image (a scan) is decoded so only the covered pixels are
-    // cleared; `jpeg_samples` returns `w * h * ncomp` bytes for the 8-bit layouts it handles, which
-    // is exactly `bytes` below. Any other DCT layout is refused, and the caller removes the image.
     let mut data = if dct {
         if bpc != 8 {
             return None;
         }
         jpeg_samples(&s.raw, ncomp, w, h)?
     } else {
-        s.decoded().ok()?
+        // Decode no further than the raster can need: a filter stage may legitimately produce up
+        // to twice it (ASCIIHex text under Flate) plus a PNG predictor's byte per row. Data past
+        // that can only be a decompression bomb; the image is then removed whole.
+        let allowance = bytes.checked_add(h)?.checked_mul(2)?.checked_add(4096)?;
+        s.decoded_within(allowance).ok()?
     };
     if data.len() < bytes {
         return None;
@@ -120,18 +128,20 @@ fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]
     };
     let mut cleared = 0usize;
     for j in 0..h {
-        // Image space: (0,0) is the bottom-left of the unit square; row 0 is the top.
-        let v = 1.0 - (j as f64 + 0.5) / h as f64;
-        let (ax, ay) = ctm.apply(0.0, v);
-        let (bx, by) = ctm.apply(1.0, v);
-        let row_box = [ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)];
-        if !rects.iter().any(|r| overlaps(*r, [row_box[0], row_box[1] - 0.01, row_box[2], row_box[3] + 0.01], 0.0)) {
+        // Image space has its origin at the bottom left; row 0 is at the top.
+        let v0 = 1.0 - (j + 1) as f64 / h as f64;
+        let v1 = 1.0 - j as f64 / h as f64;
+        let row_box = ctm.bbox([0.0, v0, 1.0, v1]);
+        if !rects.iter().any(|r| overlaps(*r, row_box, 0.0)) {
             continue;
         }
         for i in 0..w {
-            let u = (i as f64 + 0.5) / w as f64;
-            let (x, y) = ctm.apply(u, v);
-            if !rects.iter().any(|r| x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3]) {
+            let u0 = i as f64 / w as f64;
+            let u1 = (i + 1) as f64 / w as f64;
+            // The bounding box may cover extra pixels for a rotated or skewed image; that
+            // conservative over-clear prevents a touched sample surviving in the file.
+            let pixel_box = ctm.bbox([u0, v0, u1, v1]);
+            if !rects.iter().any(|r| overlaps(*r, pixel_box, 0.0)) {
                 continue;
             }
             cleared += 1;
