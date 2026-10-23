@@ -15,6 +15,9 @@ const MAX_PIXELS: u64 = 64 << 20;
 /// size and component count its dictionary declares (the caller then removes the image, as for
 /// any other undecodable codec).
 fn jpeg_samples(raw: &[u8], ncomp: usize, w: usize, h: usize) -> Option<Vec<u8>> {
+    if jpeg_source_components(raw)? != ncomp {
+        return None;
+    }
     let mut reader = ::image::ImageReader::with_format(std::io::Cursor::new(raw), ::image::ImageFormat::Jpeg);
     let mut limits = ::image::Limits::default();
     // Match the PDF's checked raster dimensions before decoding, so a mismatched JPEG header
@@ -31,6 +34,56 @@ fn jpeg_samples(raw: &[u8], ncomp: usize, w: usize, h: usize) -> Option<Vec<u8>>
         (3, ::image::ColorType::Rgb8) => img.into_rgb8().into_raw(),
         _ => return None,
     })
+}
+
+/// Read the JPEG frame's encoded component count before the image decoder can convert its output.
+fn jpeg_source_components(raw: &[u8]) -> Option<usize> {
+    if raw.get(..2)? != b"\xff\xd8" {
+        return None;
+    }
+    let mut pos = 2;
+    while pos < raw.len() {
+        if raw.get(pos).copied()? != 0xff {
+            return None;
+        }
+        while raw.get(pos).copied() == Some(0xff) {
+            pos += 1;
+        }
+        let marker = raw.get(pos).copied()?;
+        pos += 1;
+        match marker {
+            // Standalone markers have no length field.
+            0x01 | 0xd0..=0xd7 => continue,
+            // The frame header must precede scan data and the end marker.
+            0x00 | 0xda | 0xd9 => return None,
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes([*raw.get(pos)?, *raw.get(pos + 1)?]));
+        if len < 2 {
+            return None;
+        }
+        let end = pos.checked_add(len)?;
+        if end > raw.len() {
+            return None;
+        }
+        if matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            let ncomp = usize::from(*raw.get(pos + 7)?);
+            if ncomp == 0 || len != 8usize.checked_add(ncomp.checked_mul(3)?)? {
+                return None;
+            }
+            return Some(ncomp);
+        }
+        pos = end;
+    }
+    None
+}
+
+fn dct_components(doc: &Document, s: &Stream) -> Option<usize> {
+    match &*doc.resolve(s.dict.get(b"ColorSpace")?) {
+        Object::Name(name) if matches!(name.as_slice(), b"DeviceGray" | b"G") => Some(1),
+        Object::Name(name) if matches!(name.as_slice(), b"DeviceRGB" | b"RGB") => Some(3),
+        _ => None,
+    }
 }
 
 fn components(doc: &Document, s: &Stream) -> Option<usize> {
@@ -92,7 +145,17 @@ fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]
     }
     let (w, h) = (w as usize, h as usize);
     let mask = matches!(s.dict.get(b"ImageMask"), Some(Object::Bool(true)));
-    let (ncomp, bpc) = if mask { (1, 1) } else { (components(doc, s)?, s.dict.int(b"BitsPerComponent")? as usize) };
+    let ncomp = if mask {
+        if dct {
+            return None;
+        }
+        1
+    } else if dct {
+        dct_components(doc, s)?
+    } else {
+        components(doc, s)?
+    };
+    let bpc = if mask { 1 } else { s.dict.int(b"BitsPerComponent")? as usize };
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return None;
     }

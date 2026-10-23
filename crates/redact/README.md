@@ -97,4 +97,5 @@ Security numbers and dates for Search & Redact.
 Custom code sets aren't supported yet.
 
 Not yet: pattern locales, struct-tree/alt-text cleanup, metadata and hidden-information
-sanitising (M8.4), re-encoding of DCT images (they are removed instead).
+sanitising (M8.4); DCT images outside the supported 8-bit DeviceGray/DeviceRGB layouts are
+removed whole (fail-closed).
