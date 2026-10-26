@@ -2148,6 +2148,13 @@ fn needs_japanese(ch: char) -> bool {
     matches!(u32::from(ch), 0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
 }
 
+/// A Unicode variation selector (U+FE00..U+FE0F): it picks a variant of the character before it
+/// and has no glyph of its own. The Type 3 fallback draws the nominal base glyph and skips the
+/// selector instead of failing the edit on it.
+fn is_variation_selector(ch: char) -> bool {
+    matches!(u32::from(ch), 0xFE00..=0xFE0F)
+}
+
 /// The chosen face has no outline for `ch`, and neither has any other: say which character it is and
 /// what the writer can do about it. A CJK character without a Japanese face in the build is about
 /// that build input, which is the one answer that changes it.
@@ -2216,10 +2223,11 @@ fn type3_font(
     max_glyphs: usize,
 ) -> Result<Type3Fallback, EditError> {
     let (faces, hebrew) = type3_faces(text, family, bold)?;
-    // Each unique character once, in order of first appearance.
+    // Each unique character once, in order of first appearance. Variation selectors are left
+    // out: no face has an outline for them, and the edit must not fail on one.
     let mut chars = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for ch in text.chars() {
+    for ch in text.chars().filter(|ch| !is_variation_selector(*ch)) {
         if seen.insert(ch) {
             chars.push(ch);
         }
@@ -2350,7 +2358,8 @@ fn add_type3_font(doc: &mut Document, fonts_res: &mut Dict, face: &CraftFont, he
 /// a font is switched only where the text moves to another font. `None` if a character has no code.
 fn type3_encode(fallback: &Type3Fallback, text: &str) -> Option<Vec<(String, Vec<u8>)>> {
     let mut runs: Vec<(usize, Vec<u8>)> = Vec::new();
-    for ch in text.chars() {
+    // Selectors show nothing and add no advance: the base glyph before them carries the text.
+    for ch in text.chars().filter(|ch| !is_variation_selector(*ch)) {
         let (font, code) = *fallback.codes.get(&ch)?;
         match runs.last_mut() {
             Some((last, bytes)) if *last == font => bytes.push(code),
@@ -3526,6 +3535,21 @@ pub(crate) fn translate_blocks(doc: &mut Document, page: usize, indexes: &[usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variation_selectors_take_no_glyph_and_no_advance() {
+        assert!(is_variation_selector('\u{FE0F}'));
+        assert!(!is_variation_selector('\u{27A1}'));
+        let fallback = Type3Fallback {
+            family: "Inter",
+            names: vec!["PCLat".into()],
+            widths: vec![('1', 0.556)],
+            codes: [('1', (0, 1))].into_iter().collect(),
+        };
+        let runs = type3_encode(&fallback, "1\u{FE0F}").expect("the selector after a drawn base is skipped, not an error");
+        assert_eq!(runs, vec![("PCLat".to_string(), vec![1u8])], "the base draws once; the selector adds no glyph and no advance");
+        assert!(type3_encode(&fallback, "\u{FE0F}").is_some_and(|runs| runs.is_empty()), "a lone selector encodes to nothing rather than failing");
+    }
 
     fn block(text: &str, rect: [f64; 4]) -> TextBlock {
         TextBlock {
