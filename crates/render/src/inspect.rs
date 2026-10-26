@@ -1198,7 +1198,7 @@ impl<'a> Inspector<'a> {
             let Some(label) = label_for_page(range, i) else {
                 // An empty custom label keeps the physical number silently; a number too
                 // long to show does so with a note, and the other ranges are unaffected.
-                if matches!(range.style, Some(b'D' | b'R' | b'r' | b'A' | b'a')) {
+                if range.is_numbered() {
                     let note = format!(
                         "labels from page {} exceed {MAX_LABEL_BYTES} UTF-8 bytes; those pages show their physical page numbers",
                         start.saturating_add(1)

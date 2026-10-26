@@ -79,12 +79,19 @@ pub struct LabelRange {
     pub style: Option<u8>,
 }
 
+impl LabelRange {
+    /// Whether `style` is one of the five numbering styles (`D`, `R`, `r`, `A`, `a`).
+    pub fn is_numbered(&self) -> bool {
+        matches!(self.style, Some(b'D' | b'R' | b'r' | b'A' | b'a'))
+    }
+}
+
 /// The label `/PageLabels` gives 0-based `page` under `range` (`range.start <= page`):
 /// `None` when the label is empty or the number is too long to show — callers keep the
 /// physical page number. An unknown style byte counts as prefix-only.
 pub fn label_for_page(range: &LabelRange, page: usize) -> Option<String> {
     let offset = u64::try_from(page.checked_sub(range.start)?).ok()?;
-    let n = if matches!(range.style, Some(b'D' | b'R' | b'r' | b'A' | b'a')) {
+    let n = if range.is_numbered() {
         range.first.checked_add(offset)?
     } else {
         0 // /St is unused when the label consists only of its prefix.
